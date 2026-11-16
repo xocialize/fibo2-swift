@@ -33,21 +33,26 @@ public final class Fibo2Pipeline {
         self.snapshot = snapshot
     }
 
-    /// Load from a snapshot of briaai/Fibo-2.0-dev: `transformer/`, `text_encoder/`, `processor/`, `vae/`, `fonts/`.
-    /// `textEncoderQuant: nil` loads no text encoder: pass one to `encode(_:encoder:)` per request.
-    public static func load(snapshot: URL, dtype: DType = .bfloat16, quant: Fibo2Quant = .bf16,
+    /// Load from a snapshot of briaai/Fibo-2.0-dev or briaai/Fibo-2.0-edit-turbo: `transformer/`, `text_encoder/`,
+    /// `processor/`, `vae/`, `fonts/`.
+    /// - `shared`: where `text_encoder/`, `processor/`, `vae/` and `fonts/` are read from, when it isn't `snapshot`. The
+    ///   two checkpoints ship the same bytes for them (sha256 compared 2026-11-15), so an Edit Turbo `transformer/` can
+    ///   run on a Dev snapshot's.
+    /// - `textEncoderQuant: nil` loads no text encoder: pass one to `encode(_:encoder:)` per request.
+    public static func load(snapshot: URL, shared: URL? = nil, dtype: DType = .bfloat16, quant: Fibo2Quant = .bf16,
                             textEncoderQuant: Fibo2TextEncoderQuant? = .bf16) async throws -> Fibo2Pipeline {
+        let shared = shared ?? snapshot
         let transformer = try Fibo2Weights.loadTransformer(snapshot: snapshot, dtype: dtype, quant: quant)
         var textEncoder: Fibo2TextEncoder? = nil
         if let textEncoderQuant {
-            textEncoder = try await Fibo2TextEncoder.load(snapshot: snapshot, dtype: dtype, quant: textEncoderQuant)
+            textEncoder = try await Fibo2TextEncoder.load(snapshot: shared, dtype: dtype, quant: textEncoderQuant)
         }
-        let vaeDir = snapshot.appendingPathComponent("vae")
+        let vaeDir = shared.appendingPathComponent("vae")
         return Fibo2Pipeline(
             transformer: transformer, textEncoder: textEncoder,
             vaeEncoder: try Flux2VAEWeights.loadEncoder(directory: vaeDir, dtype: .float32),
             vae: try Flux2VAEWeights.loadVAE(directory: vaeDir, dtype: .float32),
-            textRenderer: try Fibo2TextRenderer(fontsDirectory: snapshot.appendingPathComponent("fonts")),
+            textRenderer: try Fibo2TextRenderer(fontsDirectory: shared.appendingPathComponent("fonts")),
             snapshot: snapshot)
     }
 

@@ -1,5 +1,6 @@
-// MLXEngine package for Bria's Fibo 2.0 Dev: `textToImage` + `imageEdit` on one core (the model is a unified
-// generator / editor; `run(_:)` dispatches on the request).
+// MLXEngine packages for Bria's Fibo 2.0 on one core:
+//   - Fibo2DevPackage (`fibo-2-dev`): `textToImage` + `imageEdit`, the full base model;
+//   - Fibo2EditTurboPackage (`fibo-2-edit-turbo`): `imageEdit` only, distilled to 4 steps without guidance.
 //
 // LICENCE (C7): the weights are CC BY-NC 4.0 (`license_name: bria-fibo`), behind Bria's non-commercial access form;
 // commercial use needs an agreement with Bria. It is declared as the SPDX id `CC-BY-NC-4.0`, package-locally, and is
@@ -31,16 +32,16 @@ public enum Fibo2PackageError: Error, LocalizedError, CustomStringConvertible {
     public var errorDescription: String? {
         switch self {
         case .unreadableSnapshot(let p):
-            return "Fibo 2.0 Dev snapshot not readable at \(p). The repo is gated: the Hugging Face account behind the "
-                + "token needs access to briaai/Fibo-2.0-dev."
+            return "Fibo 2.0 snapshot not readable at \(p). The repo is gated: the Hugging Face account behind the "
+                + "token needs access to it."
         case .imageDecode: return "Could not decode an input image."
         case .pngEncode: return "PNG encoding failed."
-        case .unsupportedQuant(let q): return "Fibo 2.0 Dev has no \(q) tier (bf16, int8 and int4 are declared)."
+        case .unsupportedQuant(let q): return "Fibo 2.0 has no \(q) tier (bf16, int8 and int4 are declared)."
         case .outsideMeasuredEnvelope(let why): return why
         }
     }
 
-    public var description: String { errorDescription ?? "Fibo 2.0 Dev error" }
+    public var description: String { errorDescription ?? "Fibo 2.0 error" }
 }
 
 /// The input envelope the manifest's footprint holds for (Fibo2Footprints). `run()` refuses anything outside it, so
@@ -106,6 +107,7 @@ public enum Fibo2MetaKeys {
 @InferenceActor
 final class Fibo2Generator {
     let pipeline: Fibo2Pipeline
+    /// The root of `text_encoder/` and `processor/`: where the per-request encoder loads from.
     let snapshot: URL
     let keepEncoderResident: Bool
     let textEncoderQuant: Fibo2TextEncoderQuant
@@ -118,7 +120,7 @@ final class Fibo2Generator {
         self.textEncoderQuant = textEncoderQuant
     }
 
-    static func load(configuration c: Fibo2Configuration, snapshot: URL) async throws -> Fibo2Generator {
+    static func load(configuration c: Fibo2Configuration, snapshot: URL, shared: URL) async throws -> Fibo2Generator {
         let quant: Fibo2Quant
         switch c.quant {
         case .bf16: quant = .bf16
@@ -126,9 +128,9 @@ final class Fibo2Generator {
         case .int4: quant = .int4
         default: throw Fibo2PackageError.unsupportedQuant(c.quant)
         }
-        let pipeline = try await Fibo2Pipeline.load(snapshot: snapshot, quant: quant, textEncoderQuant: nil)
+        let pipeline = try await Fibo2Pipeline.load(snapshot: snapshot, shared: shared, quant: quant, textEncoderQuant: nil)
         MLX.Memory.clearCache()
-        return Fibo2Generator(pipeline: pipeline, snapshot: snapshot, keepEncoderResident: c.keepEncoderResident,
+        return Fibo2Generator(pipeline: pipeline, snapshot: shared, keepEncoderResident: c.keepEncoderResident,
                               textEncoderQuant: c.textEncoderQuant)
     }
 
@@ -164,9 +166,11 @@ final class Fibo2Generator {
 @InferenceActor
 enum Fibo2Serving {
     static func load(_ c: Fibo2Configuration) async throws -> Fibo2Generator {
-        guard let snapshot = c.resolvedSnapshotDirectory(storeRoot: c.modelsRootDirectory), Fibo2Configuration.complete(snapshot)
-        else { throw Fibo2PackageError.unreadableSnapshot(c.snapshotPath.isEmpty ? Fibo2Configuration.repo : c.snapshotPath) }
-        return try await Fibo2Generator.load(configuration: c, snapshot: snapshot)
+        guard let snapshot = c.resolvedSnapshotDirectory(storeRoot: c.modelsRootDirectory), Fibo2Configuration.hasTransformer(snapshot)
+        else { throw Fibo2PackageError.unreadableSnapshot(c.snapshotPath.isEmpty ? c.variant.repo : c.snapshotPath) }
+        guard let shared = c.resolvedSharedDirectory(storeRoot: c.modelsRootDirectory), Fibo2Configuration.hasShared(shared)
+        else { throw Fibo2PackageError.unreadableSnapshot(c.sharedSnapshotPath.isEmpty ? c.variant.repo : c.sharedSnapshotPath) }
+        return try await Fibo2Generator.load(configuration: c, snapshot: snapshot, shared: shared)
     }
 
     static func run(_ request: any CapabilityRequest, generator: Fibo2Generator,
@@ -176,7 +180,10 @@ enum Fibo2Serving {
         let meta: MetaData
         switch request.capability {
         case .textToImage:
-            guard let t2i = request as? T2IRequest else { throw PackageError.unsupportedCapability(request.capability) }
+            // Edit Turbo is distilled for editing only.
+            guard c.variant == .dev, let t2i = request as? T2IRequest else {
+                throw PackageError.unsupportedCapability(request.capability)
+            }
             req.prompt = t2i.prompt
             // The model card's text-to-image negative, unless the caller sends one. Edits default to the null caption.
             req.negativePrompt = t2i.negativePrompt ?? Fibo2Prompt.cardNegativeT2I
@@ -236,10 +243,38 @@ enum Fibo2Serving {
     nonisolated static let licenceNote =
         "CC BY-NC 4.0 WEIGHTS: non-commercial use only; commercial use needs an agreement with Bria."
 
-    nonisolated static var manifest: PackageManifest {
-        PackageManifest(
+    nonisolated static func manifest(_ variant: Fibo2Variant) -> PackageManifest {
+        let edit: String
+        let surfaces: [ToolDescriptor]
+        let editCommon = "The prompt is the edit instruction (\"replace the jacket with a red leather one\"), or a JSON "
+            + "object with \"edit_instruction\" and the caption of the result under \"structured_caption\". Several "
+            + "images are named in order as <image_1>, <image_2>. The result is drawn from noise at the size trained for "
+            + "the first image's aspect ratio (about one megapixel), which crops it to that ratio. metaData[\"mask\"] "
+            + "(a base64 PNG the image's size, white = the region to regenerate) confines the edit of a single image. "
+            + "Up to 5 images; every image adds its tokens to every step. "
+        switch variant {
+        case .dev:
+            edit = "Fibo 2.0 Dev instruction editing, 50 steps with guidance 5 (about 6 minutes with one image on an M5 "
+                + "Max; Fibo 2.0 Edit Turbo does it in 4 steps). " + editCommon + licenceNote
+            surfaces = [
+                T2IContract.descriptor(
+                    name: variant.packageName,
+                    summary: "Fibo 2.0 Dev text-to-image (Bria, 8.1B single-stream DiT on Qwen3-VL-4B, FLUX.2 VAE): the "
+                        + "full base model, 50 steps with classifier-free guidance 5, about one megapixel (1024×1024, "
+                        + "1424×800, 1248×832, …). Two DiT passes per step: about 3.5 s a step on an M5 Max. "
+                        + promptGuidance
+                        + "negativePrompt defaults to the model card's text-to-image negative. " + licenceNote,
+                    modes: []),
+                IEditContract.descriptor(name: variant.packageName, summary: edit, modes: []),
+            ]
+        case .editTurbo:
+            edit = "Fibo 2.0 Edit Turbo instruction editing (Bria; distilled from Fibo 2.0 Dev): 4 steps without "
+                + "guidance, one DiT pass a step, so a negative prompt does nothing. Editing only. " + editCommon + licenceNote
+            surfaces = [IEditContract.descriptor(name: variant.packageName, summary: edit, modes: [])]
+        }
+        return PackageManifest(
             license: LicenseDeclaration(weightLicense: .ccByNC4, portCodeLicense: .mit),
-            provenance: Provenance(sourceRepo: Fibo2Configuration.repo, revision: Fibo2Configuration.revision, tier: 1),
+            provenance: Provenance(sourceRepo: variant.repo, revision: variant.revision, tier: 1),
             requirements: RequirementsManifest(
                 footprints: Fibo2Footprints.declared,
                 requiredBackends: [.metalGPU],
@@ -247,27 +282,7 @@ enum Fibo2Serving {
                 chipFloor: nil  // memory admission gates
             ),
             specialties: [],
-            surfaces: [
-                T2IContract.descriptor(
-                    name: "fibo-2-dev",
-                    summary: "Fibo 2.0 Dev text-to-image (Bria, 8.1B single-stream DiT on Qwen3-VL-4B, FLUX.2 VAE): the "
-                        + "full base model, 50 steps with classifier-free guidance 5, about one megapixel (1024×1024, "
-                        + "1424×800, 1248×832, …). Two DiT passes per step: about 3.5 s a step on an M5 Max. "
-                        + promptGuidance
-                        + "negativePrompt defaults to the model card's text-to-image negative. " + licenceNote,
-                    modes: []),
-                IEditContract.descriptor(
-                    name: "fibo-2-dev",
-                    summary: "Fibo 2.0 Dev instruction editing: the prompt is the edit instruction (\"replace the jacket "
-                        + "with a red leather one\"), or a JSON object with \"edit_instruction\" and the caption of the "
-                        + "result under \"structured_caption\". Several images are named in order as <image_1>, "
-                        + "<image_2>. The result is drawn from noise at the size trained for the first image's aspect "
-                        + "ratio (about one megapixel), which crops it to that ratio. metaData[\"mask\"] (a base64 PNG "
-                        + "the image's size, white = the region to regenerate) confines the edit of a single image. "
-                        + "Up to 5 images. Slower than text-to-image: every image adds its tokens to every step "
-                        + "(about 2× the time with one image, 4× with two, 11× with five). " + licenceNote,
-                    modes: []),
-            ]
+            surfaces: surfaces
         )
     }
 }
@@ -276,13 +291,16 @@ enum Fibo2Serving {
 public final class Fibo2DevPackage: ModelPackage {
     public typealias Configuration = Fibo2Configuration
 
-    public nonisolated static var manifest: PackageManifest { Fibo2Serving.manifest }
+    public nonisolated static var manifest: PackageManifest { Fibo2Serving.manifest(.dev) }
 
     let configuration: Configuration
     private var generator: Fibo2Generator?
 
+    /// The variant is this package's, whatever the configuration carries.
     public nonisolated init(configuration: Configuration) {
-        self.configuration = configuration
+        var c = configuration
+        c.variant = .dev
+        self.configuration = c
     }
 
     public func load() async throws {
@@ -304,4 +322,41 @@ public final class Fibo2DevPackage: ModelPackage {
 
 extension Fibo2DevPackage {
     public nonisolated static var registration: PackageRegistration { .of(Fibo2DevPackage.self) }
+}
+
+/// Fibo 2.0 Edit Turbo: the same architecture, distilled from Dev to 4 steps without guidance, for editing only.
+@InferenceActor
+public final class Fibo2EditTurboPackage: ModelPackage {
+    public typealias Configuration = Fibo2Configuration
+
+    public nonisolated static var manifest: PackageManifest { Fibo2Serving.manifest(.editTurbo) }
+
+    let configuration: Configuration
+    private var generator: Fibo2Generator?
+
+    public nonisolated init(configuration: Configuration) {
+        var c = configuration
+        c.variant = .editTurbo
+        self.configuration = c
+    }
+
+    public func load() async throws {
+        guard generator == nil else { return }
+        generator = try await Fibo2Serving.load(configuration)
+    }
+
+    public func unload() async {
+        generator = nil
+        MLX.Memory.clearCache()
+    }
+
+    public func run(_ request: any CapabilityRequest) async throws -> any CapabilityResponse {
+        try Task.checkCancellation()  // CAN-1: first act of run()
+        guard let generator else { throw PackageError.notLoaded }
+        return try await Fibo2Serving.run(request, generator: generator, configuration: configuration)
+    }
+}
+
+extension Fibo2EditTurboPackage {
+    public nonisolated static var registration: PackageRegistration { .of(Fibo2EditTurboPackage.self) }
 }

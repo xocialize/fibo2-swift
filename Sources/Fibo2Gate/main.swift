@@ -15,7 +15,7 @@
 // 1e-3 per GEMM (encoder bundles with images 0.9993 instead of 1.000000).
 //   Fibo2Gate render   <snapshot> --prompt <text|@file> [--negative <text|@file|card>] [--image p]… [--mask p]
 //                      [--size WxH] [--steps n] [--guidance g] [--seed s] [--quant bf16|int8|int4] [--te bf16|int8]
-//                      [--noise file.safetensors] [--dtype fp32|bf16] [--drop-te] [--compare ref.png] [--no-text-images] --out out.png
+//                      [--noise file.safetensors] [--dtype fp32|bf16] [--drop-te] [--shared <snapshot>] [--compare ref.png] [--no-text-images] --out out.png
 
 import Fibo2
 import Flux2VAE
@@ -373,8 +373,12 @@ case "dit":
     let quant = Fibo2Quant(rawValue: mode) ?? .bf16
     let model = try Fibo2Weights.loadTransformer(snapshot: snapshot, dtype: dtype(mode), quant: quant)
     let floor: Float = mode == "fp32" ? 0.9999 : (mode == "bf16" ? 0.998 : (mode == "int8" ? 0.99 : 0.9))
+    // FIBO2_DIT_GOLDENS: the golden folder under <goldens> (default "dit"; "dit-turbo" for Edit Turbo's weights).
+    let ditFolder = ProcessInfo.processInfo.environment["FIBO2_DIT_GOLDENS"] ?? "dit"
     for name in ["t2i", "edit"] {
-        let g = try MLX.loadArrays(url: goldens.appendingPathComponent("dit/\(name).safetensors"))
+        let url = goldens.appendingPathComponent("\(ditFolder)/\(name).safetensors")
+        guard FileManager.default.fileExists(atPath: url.path) else { continue }
+        let g = try MLX.loadArrays(url: url)
         let x = g["in.x"]!
         let grid = Fibo2Transformer.Grid(rows: x.dim(2) / 2, columns: x.dim(3) / 2)
         var context: MLXArray? = nil
@@ -441,6 +445,8 @@ case "render":
     var renderDType = DType.bfloat16
     // The engine package's memory path: no resident text encoder; it loads per request and is released before denoising.
     var dropEncoder = false
+    // Where text_encoder/, processor/, vae/ and fonts/ are read from, when the snapshot holds a transformer only.
+    var shared: URL? = nil
     func text(_ v: String) -> String {
         guard v.hasPrefix("@") else { return v }
         guard let s = try? String(contentsOfFile: String(v.dropFirst()), encoding: .utf8) else { fail("cannot read \(v)") }
@@ -464,6 +470,7 @@ case "render":
         case "--seed": request.seed = UInt64(value()) ?? die("--seed s")
         case "--quant": quant = Fibo2Quant(rawValue: value()) ?? die("--quant bf16|int8|int4")
         case "--te": te = Fibo2TextEncoderQuant(rawValue: value()) ?? die("--te bf16|int8")
+        case "--shared": shared = URL(fileURLWithPath: value())
         case "--drop-te": dropEncoder = true
         case "--dtype": renderDType = dtype(value())
         case "--compare": compare = value()
@@ -477,7 +484,7 @@ case "render":
     guard let out, !request.prompt.isEmpty else { fail("render needs --prompt and --out") }
     var clock = Date()
     if dropEncoder { MLX.Memory.cacheLimit = 2 << 30 }  // the engine's pool cap
-    let pipeline = try await Fibo2Pipeline.load(snapshot: snapshot, dtype: renderDType, quant: quant,
+    let pipeline = try await Fibo2Pipeline.load(snapshot: snapshot, shared: shared, dtype: renderDType, quant: quant,
                                                 textEncoderQuant: dropEncoder ? nil : te)
     MLX.Memory.clearCache()
     let resident = MLX.Memory.activeMemory
@@ -492,7 +499,7 @@ case "render":
     if dropEncoder {
         // The encoder lives only inside this scope.
         encoded = try await { () async throws -> Fibo2Pipeline.Encoded in
-            let encoder = try await Fibo2TextEncoder.load(snapshot: snapshot, dtype: renderDType, quant: te)
+            let encoder = try await Fibo2TextEncoder.load(snapshot: shared ?? snapshot, dtype: renderDType, quant: te)
             return try pipeline.encode(request, encoder: encoder)
         }()
         MLX.Memory.clearCache()

@@ -1,7 +1,8 @@
 # fibo2-swift
 
-Swift/MLX port of [briaai/Fibo-2.0-dev](https://huggingface.co/briaai/Fibo-2.0-dev): text-to-image, instruction
-editing, masked editing and multi-image editing (up to 5 images) in one set of weights.
+Swift/MLX port of Bria's Fibo 2.0: [Fibo 2.0 Dev](https://huggingface.co/briaai/Fibo-2.0-dev) (text-to-image,
+instruction editing, masked editing and multi-image editing of up to 5 images in one set of weights) and
+[Fibo 2.0 Edit Turbo](https://huggingface.co/briaai/Fibo-2.0-edit-turbo) (the same edits in 4 steps).
 - **DiT:** 8.1B parameters, 44 single-stream Z-Image blocks. A Perceiver resampler turns the prompt into 256–512
   "gist" tokens; five blocks also cross-attend to the text encoder directly.
 - **Conditioner:** 15 hidden-state taps of Qwen3-VL-4B-Instruct, which also sees the images to edit and small
@@ -83,16 +84,34 @@ image 7.6 s, two images 12.8 s, five images 38.8 s. The card's 50 steps take abo
 
 `MLXFibo2.Fibo2DevPackage` (PackageID `fibo-2-dev`): `textToImage` and `imageEdit`. Weight licence `CC-BY-NC-4.0`,
 declared package-locally and not allowlisted. Weights come from `briaai/Fibo-2.0-dev`, pinned by commit, into the
-engine's model store.
+engine's model store. `Fibo2EditTurboPackage` is described below.
 - `T2IRequest`: `negativePrompt` defaults to the model card's text-to-image negative. Sizes are multiples of 16
   around one megapixel (at most 1.1 × 1024² of area).
 - `IEditRequest`: 1–5 images. `metaData["mask"]` is a base64 PNG the size of the single image; white is the region
   to regenerate.
 - `metaData["textImages"] = false` skips drawing the caption's texts for Qwen3-VL.
 
+## Fibo 2.0 Edit Turbo
+
+The same architecture, distilled from Dev for editing: 4 steps, no guidance (one DiT pass a step, and a negative prompt
+does nothing). Its repo ships the same text encoder, tokenizer, VAE and fonts as Dev's, byte for byte, so only its
+`transformer/` is needed beside a Dev snapshot:
+
+```bash
+swift run -c release Fibo2Gate render <edit-turbo snapshot> --shared <dev snapshot> --prompt "replace the dog with a black cat" --image dog.png --steps 4 --guidance 1 --out cat.png
+```
+
+- **Against diffusers** (bf16 on both sides, same noise, 384×768, 4 steps): one image 45.0 dB, two images 27.6 dB
+  with the same composition.
+- **Lanes**, same seed, one image at 720×1440: int8 is 46.8 dB from bf16, int4 37.7 dB. Four unguided steps amplify
+  far less than Dev's fifty guided ones.
+- **Memory** is Dev's, lane for lane.
+- **Time:** 4 DiT passes instead of 100. From Dev's measured time per pass, about 15 s of denoising for a one-image
+  edit at one megapixel, plus about 5 s to encode and decode. Not yet timed on a quiet GPU.
+- **Engine package:** `MLXFibo2.Fibo2EditTurboPackage` (`fibo-2-edit-turbo`), `imageEdit` only. With a Dev snapshot in
+  the model store it fetches only the 16 GB transformer.
+
 ## Not here
 
-- **Fibo 2.0 Edit Turbo** (few steps, no guidance): the same architecture, so a second checkpoint for this code.
-  It is gated separately.
 - LoRA loading and the model card's style presets.
 - A local caption writer. A `fibo2` profile for the fleet's prompt-enhance plugin is the planned route.

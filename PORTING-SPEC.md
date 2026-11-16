@@ -154,7 +154,24 @@ The package keeps the DiT and the VAE resident. The encoder loads per request an
   5 images 38.8 s. So 50 steps: about 3 min, 6 min, 11 min and 32 min.
 - **e2e edit**, same noise, 384×768, 12 steps: Swift bf16 against diffusers fp32 41.1 dB.
 
-## 5. Known hazards
+## 5. Fibo 2.0 Edit Turbo (v0.2.0)
+
+- **Repo:** `briaai/Fibo-2.0-edit-turbo` @ `7b133d62d92e897f1468af0427a73cc41a03cb5d`, gated separately, CC BY-NC 4.0.
+- **Same architecture and scheduler config** as Dev (`transformer/config.json` and `scheduler_config.json` equal).
+  Only the transformer's weights differ: `text_encoder/model.safetensors`, `vae/…`, `processor/tokenizer.json`
+  and the fonts have Dev's LFS sha256.
+- **Sampling:** 4 steps, `guidance_scale` 1 (no negative pass). Editing only; the card sends text-to-image to Dev.
+- **Loading:** `Fibo2Pipeline.load(snapshot:shared:)` reads `transformer/` from one snapshot and the shared
+  components from another. The package declares two weight sources in the Turbo repo (`transformer`, `shared`);
+  a Dev snapshot already in the store satisfies `shared`.
+- **Reference:** diffusers in bf16 on MPS (`e2e.py` with `FIBO2_TRANSFORMER` and `FIBO2_BF16=1`); the fp32 CPU
+  reference needs 50 GB, which the machine didn't have free.
+- **e2e, same noise, 384×768, 4 steps** (Swift bf16 against torch bf16): one image 45.0 dB; two images 27.6 dB,
+  same composition. This is also the first end-to-end comparison of a multi-image edit.
+- **Lanes** (same seed, one image, 720×1440): int8 46.8 dB from bf16, int4 37.7 dB. Memory equals Dev's.
+- **Time:** not measured on a quiet GPU. From Dev's 3.8 s per pass with one image, about 15 s for the 4 steps.
+
+## 6. Known hazards
 
 - **Speed.** Dev is the non-distilled base: 2 DiT passes per step, 50 steps by the card. Fibo 2.0 Edit Turbo
   (same architecture, few steps, no CFG) is the practical edit model; it is gated separately.

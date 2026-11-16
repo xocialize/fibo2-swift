@@ -11,7 +11,7 @@ import XCTest
 final class Fibo2PackageTests: XCTestCase {
     /// The upstream snapshot in the Hugging Face cache, when this machine has it.
     static let snapshot: String? = {
-        let root = "/Volumes/DEV_VOL1/Models/models--briaai--Fibo-2.0-dev/snapshots/" + Fibo2Configuration.revision
+        let root = "/Volumes/DEV_VOL1/Models/models--briaai--Fibo-2.0-dev/snapshots/" + Fibo2Variant.dev.revision
         return FileManager.default.fileExists(atPath: root + "/transformer/config.json") ? root : nil
     }()
 
@@ -78,7 +78,7 @@ final class Fibo2PackageTests: XCTestCase {
     }
 
     func testConfigurationRoundTrips() throws {
-        let c = Fibo2Configuration(quant: .int8, textEncoderQuant: .int8, defaultSteps: 30, keepEncoderResident: true)
+        let c = Fibo2Configuration(quant: .int8, textEncoderQuant: .int8, steps: 30, keepEncoderResident: true)
         let back = try JSONDecoder().decode(Fibo2Configuration.self, from: JSONEncoder().encode(c))
         XCTAssertEqual(back.quant, .int8)
         XCTAssertEqual(back.textEncoderQuant, .int8)
@@ -86,9 +86,72 @@ final class Fibo2PackageTests: XCTestCase {
         XCTAssertTrue(back.keepEncoderResident)
         let old = try JSONDecoder().decode(Fibo2Configuration.self, from: Data(#"{"quant":"bf16"}"#.utf8))
         XCTAssertEqual(old.defaultSteps, 50)
+        XCTAssertEqual(old.variant, .dev, "a configuration saved before 0.2.0 is Dev's")
         XCTAssertFalse(old.keepEncoderResident)
         XCTAssertNil(old.residentBytesHint)
         XCTAssertGreaterThan(c.residentBytesHint!, Fibo2Footprints.declared.first { $0.quant == .int8 }!.residentBytes)
+    }
+
+    // MARK: Edit Turbo (0.2.0)
+
+    func testEditTurboIsEditOnlyWithItsOwnDefaults() {
+        let m = Fibo2EditTurboPackage.manifest
+        XCTAssertEqual(m.surfaces.map(\.capability), [.imageEdit])
+        XCTAssertEqual(m.surfaces[0].name, "fibo-2-edit-turbo")
+        XCTAssertEqual(m.license.weightLicense, .ccByNC4)
+        XCTAssertEqual(m.provenance.sourceRepo, "briaai/Fibo-2.0-edit-turbo")
+        XCTAssertEqual(m.provenance.revision.count, 40)
+        let c = Fibo2Configuration(variant: .editTurbo)
+        XCTAssertEqual(c.defaultSteps, 4)
+        XCTAssertEqual(c.defaultGuidance, 1)
+        XCTAssertEqual(Fibo2Configuration(variant: .editTurbo, steps: 8).defaultSteps, 8)
+        XCTAssertEqual(Fibo2Configuration().defaultSteps, 50)
+        XCTAssertEqual(Fibo2Configuration().defaultGuidance, 5)
+    }
+
+    /// Edit Turbo fetches its transformer and the shared components as two sources of its own repo, so a Dev
+    /// snapshot already in the store satisfies the second.
+    func testEditTurboWeightSources() {
+        let s = Fibo2Configuration(variant: .editTurbo).weightSources
+        XCTAssertEqual(s.map(\.role), ["transformer", "shared"])
+        XCTAssertTrue(s.allSatisfy { $0.repo == "briaai/Fibo-2.0-edit-turbo" && $0.revision?.count == 40 })
+        XCTAssertTrue(s[0].matching?.contains("transformer/*") ?? false)
+        XCTAssertFalse(s[0].matching?.contains("text_encoder/*") ?? true)
+        XCTAssertTrue(s[1].matching?.contains("text_encoder/*") ?? false)
+        // A fresh store misses both.
+        let empty = FileManager.default.temporaryDirectory.appending(path: "fibo2-empty-\(UUID().uuidString)")
+        XCTAssertEqual(Fibo2Configuration(variant: .editTurbo).missingWeightSources(storeRoot: empty).map(\.role), ["transformer", "shared"])
+        XCTAssertEqual(Fibo2Configuration().missingWeightSources(storeRoot: empty).map(\.role), ["snapshot"])
+    }
+
+    /// With Dev installed, Edit Turbo's shared components resolve to Dev's snapshot and only its transformer is missing.
+    func testEditTurboSharesAnInstalledDev() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appending(path: "fibo2-store-\(UUID().uuidString)")
+        let dev = root.appending(path: "models--briaai--Fibo-2.0-dev/snapshots/\(Fibo2Variant.dev.revision)")
+        for file in ["transformer/config.json", "text_encoder/config.json", "processor/tokenizer.json", "vae/config.json"] {
+            let url = dev.appending(path: file)
+            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("{}".utf8).write(to: url)
+        }
+        let turbo = Fibo2Configuration(variant: .editTurbo)
+        XCTAssertEqual(turbo.missingWeightSources(storeRoot: root).map(\.role), ["transformer"])
+        XCTAssertEqual(turbo.resolvedSharedDirectory(storeRoot: root)?.standardizedFileURL, dev.standardizedFileURL)
+        XCTAssertTrue(Fibo2Configuration().missingWeightSources(storeRoot: root).isEmpty)
+        // Its own transformer lands: nothing is missing.
+        let own = root.appending(path: "models--briaai--Fibo-2.0-edit-turbo/snapshots/\(Fibo2Variant.editTurbo.revision)/transformer/config.json")
+        try fm.createDirectory(at: own.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: own)
+        XCTAssertTrue(turbo.missingWeightSources(storeRoot: root).isEmpty)
+        try? fm.removeItem(at: root)
+    }
+
+    func testEditTurboPackageFixesItsVariant() async {
+        // A Dev-shaped configuration handed to the Turbo package is still Turbo's.
+        let package = Fibo2EditTurboPackage(configuration: Fibo2Configuration())
+        let report = await CancellationConformance.checkRun(package: package, request: IEditRequest(images: [], prompt: "probe"))
+        XCTAssertTrue(report.passed, report.summary)
+        XCTAssertTrue(CancellationConformance.longRunImplied(by: Fibo2EditTurboPackage.manifest))
     }
 
     func testMetaLevers() throws {

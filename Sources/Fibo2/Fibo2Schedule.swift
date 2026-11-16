@@ -8,6 +8,9 @@ import MLX
 public enum Fibo2Schedule {
     public static let defaultSteps = 50
     public static let defaultGuidance: Float = 5.0
+    /// Fibo 2.0 Edit Turbo: distilled to 4 steps without guidance (one DiT pass a step; a negative prompt does nothing).
+    public static let turboSteps = 4
+    public static let turboGuidance: Float = 1.0
     /// A generation shows the images of its caption's text to Qwen3-VL only once the noise level is at or below this.
     public static let textImagesMaxNoiseLevel: Float = 0.9
 
