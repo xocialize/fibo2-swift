@@ -35,8 +35,11 @@ final class Fibo2PackageTests: XCTestCase {
         let r = Dictionary(uniqueKeysWithValues: fp.map { ($0.quant, $0.residentBytes) })
         XCTAssertGreaterThan(r[.bf16]!, r[.int8]!)
         XCTAssertGreaterThan(r[.int8]!, r[.int4]!)
-        // The measured worst request (an edit's encode phase, 10.89 GB) is under the declared activation.
-        XCTAssertTrue(fp.allSatisfy { $0.peakActivationBytes >= 10_890_000_000 })
+        // The declared totals cover the measured process peaks of the worst request (a one-image edit).
+        let total = Dictionary(uniqueKeysWithValues: fp.map { ($0.quant, $0.residentBytes + $0.peakActivationBytes) })
+        XCTAssertGreaterThanOrEqual(total[.bf16]!, 29_850_000_000)
+        XCTAssertGreaterThanOrEqual(total[.int8]!, 22_530_000_000)
+        XCTAssertGreaterThanOrEqual(total[.int4]!, 20_720_000_000)
         XCTAssertEqual(Fibo2Envelope.maxImages, 5)
     }
 

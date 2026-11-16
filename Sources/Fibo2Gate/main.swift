@@ -68,6 +68,18 @@ func psnr(_ a: Fibo2RGBImage, _ b: Fibo2RGBImage) -> Double? {
     return mse == 0 ? .infinity : 10 * log10(255 * 255 / mse)
 }
 
+/// The process's phys_footprint now and its lifetime peak, in GB (what a host's memory governor sees; MLX's own
+/// counters miss load-time transients outside its pool).
+func physFootprint() -> (now: Double, peak: Double) {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
+    }
+    guard kr == KERN_SUCCESS else { return (0, 0) }
+    return (Double(info.phys_footprint) / 1e9, Double(info.ledger_phys_footprint_peak) / 1e9)
+}
+
 func dtype(_ name: String) -> DType { name == "fp32" ? .float32 : .bfloat16 }
 
 nonisolated(unsafe) var passed = true
@@ -471,6 +483,7 @@ case "render":
     let resident = MLX.Memory.activeMemory
     print(String(format: "loaded in %.1f s (DiT %@, encoder %@%@), resident %.2f GB", Date().timeIntervalSince(clock),
                  quant.rawValue, te.rawValue, dropEncoder ? ", per request" : "", Double(resident) / 1e9))
+    print(String(format: "  phys_footprint after load: %.2f GB now, %.2f GB peak (the load transient)", physFootprint().now, physFootprint().peak))
     var noise: MLXArray? = nil
     if let noiseFile { noise = try MLX.loadArrays(url: URL(fileURLWithPath: noiseFile))["noise"] }
     clock = Date()
@@ -485,6 +498,7 @@ case "render":
         MLX.Memory.clearCache()
         print(String(format: "  encode phase: %.1f s, peak %.2f GB (+%.2f over resident)", Date().timeIntervalSince(clock),
                      Double(MLX.Memory.peakMemory) / 1e9, Double(MLX.Memory.peakMemory - resident) / 1e9))
+        print(String(format: "  phys_footprint after encode: %.2f GB now, %.2f GB peak", physFootprint().now, physFootprint().peak))
         MLX.Memory.peakMemory = 0
     }
     let result = try pipeline.generate(request, encoded: encoded, noise: noise) { step, steps in
@@ -496,6 +510,7 @@ case "render":
         print(String(format: "  denoise + decode: peak %.2f GB (+%.2f over resident)", Double(MLX.Memory.peakMemory) / 1e9,
                      Double(MLX.Memory.peakMemory - resident) / 1e9))
     }
+    print(String(format: "  phys_footprint at the end: %.2f GB now, %.2f GB peak", physFootprint().now, physFootprint().peak))
     try result.image.write(to: URL(fileURLWithPath: out))
     let t = result.timings
     print(String(format: "%d×%d, %d steps, guidance %.1f: encode %.1f s, gist %.1f s, denoise %.1f s, decode %.1f s; peak %.2f GB",

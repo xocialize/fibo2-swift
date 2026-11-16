@@ -42,6 +42,27 @@ public enum Fibo2Weights {
             .filter { $0.pathExtension == "safetensors" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
         guard !files.isEmpty else { throw Fibo2Error.loading("no transformer/*.safetensors under \(snapshot.path)") }
         let config = try config(snapshot: snapshot)
+        let model = Fibo2Transformer(config)
+        // The checkpoint dictionary lives only inside this scope. A quantized tier evaluates and drops the bf16
+        // weights block by block; a dictionary still holding them would keep all 16 GB alive beside the quantized
+        // copy (int8: a 24.9 GB process peak at load, measured, against 9.8 GB once it is released first).
+        try loadWeights(into: model, files: files, config: config, dtype: dtype, evaluate: quant.bits == nil)
+        model.dtype = dtype
+        if let bits = quant.bits {
+            quantizeTransformer(model, bits: bits, groupSize: groupSize, eightBit: quant == .int4 ? int4EightBitLayers : [])
+        }
+        return model
+    }
+
+    /// The int4 tier's 8-bit layers: every attention projection and the FFN down-projection (`w2`); the FFN's two
+    /// up-projections (`w1`, `w3`), 39 % of a block, are the 4-bit part. Uniform 4-bit (group 64) puts the velocity at
+    /// cos 0.979 (text-to-image) / 0.985 (edit) against fp32; this recipe reads 0.9925 / 0.9952, the best of six
+    /// probed (attention alone 0.984 / 0.994, `w2` alone 0.982 / 0.986, group 32 0.980 / 0.991, attention at group 32
+    /// 0.983 / 0.994). int8 reads 0.9989 / 0.9996.
+    public static let int4EightBitLayers = ["to_q", "to_k", "to_v", "to_out", "feed_forward.w2", "ffn.w2"]
+
+    static func loadWeights(into model: Fibo2Transformer, files: [URL], config: Fibo2DiTConfig, dtype: DType,
+                            evaluate: Bool) throws {
         var weights: [String: MLXArray] = [:]
         var gates: [Int: MLXArray] = [:]
         for file in files {
@@ -57,21 +78,8 @@ public enum Fibo2Weights {
             throw Fibo2Error.loading("cross_attn_gate keys \(gates.keys.sorted()) ≠ injection layers \(config.injectionLayerIds)")
         }
         weights["cross_attn_gates"] = concatenated(config.injectionLayerIds.map { gates[$0]! }, axis: 0)
-        let model = Fibo2Transformer(config)
-        try verifyAndLoad(model: model, weights: weights, label: "Fibo 2.0 DiT", evaluate: quant.bits == nil)
-        model.dtype = dtype
-        if let bits = quant.bits {
-            quantizeTransformer(model, bits: bits, groupSize: groupSize, eightBit: quant == .int4 ? int4EightBitLayers : [])
-        }
-        return model
+        try verifyAndLoad(model: model, weights: weights, label: "Fibo 2.0 DiT", evaluate: evaluate)
     }
-
-    /// The int4 tier's 8-bit layers: every attention projection and the FFN down-projection (`w2`); the FFN's two
-    /// up-projections (`w1`, `w3`), 39 % of a block, are the 4-bit part. Uniform 4-bit (group 64) puts the velocity at
-    /// cos 0.979 (text-to-image) / 0.985 (edit) against fp32; this recipe reads 0.9925 / 0.9952, the best of six
-    /// probed (attention alone 0.984 / 0.994, `w2` alone 0.982 / 0.986, group 32 0.980 / 0.991, attention at group 32
-    /// 0.983 / 0.994). int8 reads 0.9989 / 0.9996.
-    public static let int4EightBitLayers = ["to_q", "to_k", "to_v", "to_out", "feed_forward.w2", "ffn.w2"]
 
     /// Layers kept at the load dtype in a quantized tier: the patch embedding, the timestep MLP, the final layer and
     /// every block's adaLN modulation producer (a 256-wide input each). About 0.17B of the 8.1B parameters.

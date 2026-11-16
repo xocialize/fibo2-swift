@@ -132,19 +132,22 @@ about 3e-4 of the largest value per GEMM.
 
 The package keeps the DiT and the VAE resident. The encoder loads per request and is released before denoising.
 
-| DiT lane | Recipe | Velocity cos vs fp32 (T2I / edit) | Resident | Declared total |
-|---|---|---|---|---|
-| bf16 | upstream weights | 0.99974 / 0.99982 | 16.59 GB | 28.3 GB |
-| int8 | affine, group 64 | 0.9989 / 0.9996 | 9.14 GB | 20.7 GB |
-| int4 | FFN up-projections (`w1`, `w3`) at 4 bits; attention projections and `w2` at 8 | 0.9925 / 0.9952 | 7.50 GB | 19.0 GB |
+| DiT lane | Recipe | Velocity cos vs fp32 (T2I / edit) | Resident | Process peak | Declared total |
+|---|---|---|---|---|---|
+| bf16 | upstream weights | 0.99974 / 0.99982 | 16.59 GB | 29.85 GB | 30.4 GB |
+| int8 | affine, group 64 | 0.9989 / 0.9996 | 9.14 GB | 22.53 GB | 22.8 GB |
+| int4 | FFN up-projections (`w1`, `w3`) at 4 bits; attention projections and `w2` at 8 | 0.9925 / 0.9952 | 7.50 GB | 20.72 GB | 21.1 GB |
 
+- Resident is MLX's pool; the process peak is `phys_footprint` on a one-image edit, about 2.4 GB above the pool's
+  peak. The declared totals cover the process peaks.
+- v0.1.1 drops the checkpoint dictionary before quantizing: the int8 load peaked at 24.88 GB in v0.1.0, 9.77 GB now.
 - Kept at the load dtype in every quantized lane: the patch embedding, the timestep MLP, the final layer, each
   block's adaLN Linear.
 - Uniform 4-bit reads 0.979 / 0.985. Six recipes were probed; see `Fibo2Weights.int4EightBitLayers`.
 - Same seed, 1024², 30 steps, a caption with two texts: all three lanes draw the same scene with both texts
   right. int8 is 26.4 dB from bf16, int4 20.0 dB (30 guided steps amplify small differences).
 - **Activation over resident:** the encode phase sets it, 9.22 GB (text-to-image) to 10.89 GB (an edit). Denoise
-  and decode take 2.4 GB at 1024², 4.93 GB with five images. Declared 11.3 GB.
+  and decode take 2.4 GB at 1024², 4.93 GB with five images. Declared 13.4 GB, which covers the process peak.
 - An int8 encoder doesn't lower that transient (it is quantized from the bf16 file at load); it only helps when
   the encoder is kept resident.
 - **Time per step** (two passes): text-to-image 1024² 3.5 s; edit with 1 image 7.6 s, 2 images 12.8 s,

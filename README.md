@@ -66,11 +66,14 @@ Against diffusers in fp32 on the CPU (`mlxengine-image/WIP/fibo2-oracle`). fp32 
 
 ## Lanes, memory and time (M5 Max)
 
-| DiT lane | Velocity cos vs fp32 | Resident | Peak (encoder loaded per request) |
-|---|---|---|---|
-| bf16 | 0.99974 | 16.6 GB | 27.5 GB |
-| int8 | 0.9989 | 9.1 GB | 20.0 GB |
-| int4 (attention and FFN-down at 8 bits) | 0.9925 | 7.5 GB | 18.4 GB |
+| DiT lane | Velocity cos vs fp32 | Resident | Process peak (encoder loaded per request) | Declared |
+|---|---|---|---|---|
+| bf16 | 0.99974 | 16.6 GB | 29.9 GB | 30.4 GB |
+| int8 | 0.9989 | 9.1 GB | 22.5 GB | 22.8 GB |
+| int4 (attention and FFN-down at 8 bits) | 0.9925 | 7.5 GB | 20.7 GB | 21.1 GB |
+
+The peak is the encode phase of an edit: the text encoder (8.9 GB) is loaded for each request and released before
+denoising, which itself needs 2.4–4.9 GB over resident.
 
 Two DiT passes per step (classifier-free guidance 5). Per step: text-to-image at 1024² 3.5 s; an edit with one
 image 7.6 s, two images 12.8 s, five images 38.8 s. The card's 50 steps take about 3 minutes for text-to-image and

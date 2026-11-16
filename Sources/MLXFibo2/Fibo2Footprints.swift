@@ -18,11 +18,25 @@
 //   edit, 2 images, ~1 MP each               10.89           2.92
 //   edit, 5 images, ~1 MP each               10.75           4.93
 //
-// The per-request encoder sets the peak at every point: 10.89 GB. Declared: resident rounded up 2–3 %, activation
-// 11.3 GB (+3.8 %). bf16 declares 28.3 GB, int8 20.7 GB, int4 19.0 GB.
+// The per-request encoder sets the peak at every point: 10.89 GB in MLX's pool.
+//
+// The process (phys_footprint, what a host's governor sees) runs about 2.4 GB above the pool: the 2 GB cache and
+// process overhead. Peaks for a one-image edit, the worst request:
+//
+//   DiT tier   after load   peak (encode phase)   at the end
+//   bf16       16.76 GB     29.85 GB              19.01 GB
+//   int8        9.77 GB     22.53 GB              11.81 GB
+//   int4        8.13 GB     20.72 GB               9.92 GB
+//
+// Declared to cover those: resident rounded up 2–3 %, activation 13.4 GB. bf16 declares 30.4 GB, int8 22.8 GB,
+// int4 21.1 GB (1.2–1.9 % over the process peaks).
+//
+// v0.1.1: a quantized tier no longer holds the bf16 checkpoint while it quantizes. In v0.1.0 the load itself peaked at
+// 24.88 GB (int8) and 23.24 GB (int4); now 9.77 GB and 8.13 GB.
 //
 // An int8 encoder does not lower the transient: it is quantized from the bf16 file at load (9.42 GB against 9.22 GB).
-// It only helps when the encoder is kept resident (`keepEncoderResident`).
+// It only helps when the encoder is kept resident (`keepEncoderResident`). Quantizing it block by block, as the DiT
+// now is, would cut the transient to about 5 GB and the int4 total to about 16 GB: an open item in qwen3vl-mlx-swift.
 //
 // Time per step, two DiT passes (bf16, quiet machine; the quantized tiers are within 5 %): text-to-image 1024² 3.5 s;
 // edit with 1 image 7.6 s, 2 images 12.8 s, 5 images 38.8 s.
@@ -38,9 +52,9 @@ enum Fibo2Footprints {
     static let envelopeMaxImages = Fibo2ImagePrep.maxImages
 
     static let declared: [QuantFootprint] = [
-        QuantFootprint(quant: .bf16, residentBytes: 17_000_000_000, peakActivationBytes: 11_300_000_000),
-        QuantFootprint(quant: .int8, residentBytes: 9_400_000_000, peakActivationBytes: 11_300_000_000),
-        QuantFootprint(quant: .int4, residentBytes: 7_700_000_000, peakActivationBytes: 11_300_000_000),
+        QuantFootprint(quant: .bf16, residentBytes: 17_000_000_000, peakActivationBytes: 13_400_000_000),
+        QuantFootprint(quant: .int8, residentBytes: 9_400_000_000, peakActivationBytes: 13_400_000_000),
+        QuantFootprint(quant: .int4, residentBytes: 7_700_000_000, peakActivationBytes: 13_400_000_000),
     ]
 
     /// The conditioner's weights (language model + vision tower), added to the resident term when kept resident.
