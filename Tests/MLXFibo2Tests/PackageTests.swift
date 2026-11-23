@@ -154,7 +154,114 @@ final class Fibo2PackageTests: XCTestCase {
         XCTAssertTrue(CancellationConformance.longRunImplied(by: Fibo2EditTurboPackage.manifest))
     }
 
+    // MARK: RMBG 3.0 (0.3.0)
+
+    func testRMBGIsMattingOnly() {
+        let m = Fibo2RMBGPackage.manifest
+        XCTAssertEqual(m.surfaces.map(\.capability), [.matting])
+        XCTAssertEqual(m.surfaces[0].name, "rmbg-3")
+        XCTAssertTrue(m.surfaces[0].summary.contains("CC BY-NC 4.0"))
+        XCTAssertEqual(m.license.weightLicense, .ccByNC4)
+        XCTAssertFalse(SPDXLicense.permissiveAllowlist.contains(m.license.weightLicense))
+        XCTAssertEqual(m.provenance.sourceRepo, "briaai/RMBG-3.0")
+        XCTAssertEqual(m.provenance.revision.count, 40)
+        XCTAssertEqual(Set(m.requirements.footprints.map(\.quant)), [.bf16, .int8, .int4])
+        let c = Fibo2Configuration(variant: .rmbg)
+        XCTAssertEqual(c.defaultSteps, 4)
+        XCTAssertEqual(c.defaultGuidance, 1)
+    }
+
+    /// The transformer is RMBG 3.0's own; the text encoder, VAE and fonts are Edit Turbo's, the card's base.
+    func testRMBGWeightSources() throws {
+        let s = Fibo2Configuration(variant: .rmbg).weightSources
+        XCTAssertEqual(s.map(\.role), ["transformer", "shared"])
+        XCTAssertEqual(s.map(\.repo), ["briaai/RMBG-3.0", "briaai/Fibo-2.0-edit-turbo"])
+        XCTAssertEqual(s[1].revision, Fibo2Variant.editTurbo.revision)
+        XCTAssertFalse(s[0].matching?.contains("scheduler/*") ?? true)  // the repo has none
+        XCTAssertTrue(s[1].matching?.contains("vae/*") ?? false)
+
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appending(path: "fibo2-store-\(UUID().uuidString)")
+        let rmbg = Fibo2Configuration(variant: .rmbg)
+        XCTAssertEqual(rmbg.missingWeightSources(storeRoot: root).map(\.role), ["transformer", "shared"])
+        func touch(_ variant: Fibo2Variant, _ files: [String]) throws -> URL {
+            let snap = root.appending(path: "models--\(variant.repo.replacingOccurrences(of: "/", with: "--"))/snapshots/\(variant.revision)")
+            for file in files {
+                let url = snap.appending(path: file)
+                try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data("{}".utf8).write(to: url)
+            }
+            return snap
+        }
+        let shared = ["text_encoder/config.json", "processor/tokenizer.json", "vae/config.json"]
+        // A Dev snapshot satisfies the shared components; so does an Edit Turbo one, which is preferred.
+        let dev = try touch(.dev, ["transformer/config.json"] + shared)
+        XCTAssertEqual(rmbg.missingWeightSources(storeRoot: root).map(\.role), ["transformer"])
+        XCTAssertEqual(rmbg.resolvedSharedDirectory(storeRoot: root)?.standardizedFileURL, dev.standardizedFileURL)
+        let turbo = try touch(.editTurbo, shared)
+        XCTAssertEqual(rmbg.resolvedSharedDirectory(storeRoot: root)?.standardizedFileURL, turbo.standardizedFileURL)
+        let own = try touch(.rmbg, ["transformer/config.json"])
+        XCTAssertTrue(rmbg.missingWeightSources(storeRoot: root).isEmpty)
+        XCTAssertEqual(rmbg.resolvedSnapshotDirectory(storeRoot: root)?.standardizedFileURL, own.standardizedFileURL)
+        try? fm.removeItem(at: root)
+    }
+
+    func testRMBGPackageFixesItsVariantAndRefusesEdits() async {
+        let package = Fibo2RMBGPackage(configuration: Fibo2Configuration(steps: 30, guidance: 5))
+        let image = Image(format: .png, data: Data(), width: 1, height: 1)
+        let report = await CancellationConformance.checkRun(package: package, request: MattingRequest(image: image))
+        XCTAssertTrue(report.passed, report.summary)
+        XCTAssertTrue(CancellationConformance.longRunImplied(by: Fibo2RMBGPackage.manifest))
+    }
+
+    /// The card's prompt and settings, and the picture's way in and out.
+    func testMatteRequestAndResult() throws {
+        XCTAssertEqual(Fibo2Matte.prompt, #"{"edit_instruction":"\#(Fibo2Matte.instruction)"}"#)
+        XCTAssertTrue(Fibo2Matte.instruction.hasPrefix("Generate a detailed grayscale alpha matte. Map the opaque foreground to white"))
+        XCTAssertTrue(Fibo2Matte.instruction.hasSuffix("to represent fine details and transparency."))
+        XCTAssertNil(Fibo2Prompt.editPromptProblem(Fibo2Matte.prompt))
+        XCTAssertEqual(Fibo2Prompt.editPrompt(Fibo2Matte.prompt, imageCount: 1, textImages: true),
+                       #"{"image":"\#(Fibo2Prompt.visionMarker)","edit_instruction":"\#(Fibo2Matte.instruction)"}"#)
+
+        // A 3:2 picture goes in whole at the trained size, so the pipeline's cover-and-crop changes nothing.
+        let source = Fibo2RGBImage(rgb: [UInt8](repeating: 200, count: 300 * 200 * 3), width: 300, height: 200)
+        let request = Fibo2Matte.request(for: source, seed: 7)
+        let size = Fibo2ImagePrep.imageSize(aspectRatio: 1.5)
+        XCTAssertEqual([request.width, request.height], [size.width, size.height])
+        XCTAssertEqual([request.images[0].width, request.images[0].height], [size.width, size.height])
+        XCTAssertEqual(request.steps, 4)
+        XCTAssertEqual(request.guidance, 1)
+        XCTAssertEqual(request.seed, 7)
+        XCTAssertNil(Fibo2Envelope.violation(width: request.width, height: request.height, imageCount: 1))
+        let prepared = Fibo2ImagePrep.prepare(images: request.images, width: request.width, height: request.height)
+        XCTAssertEqual(prepared.crops[0], request.images[0])
+        XCTAssertEqual(Fibo2Matte.request(for: source, fit: .crop).images[0], source)  // the card's way: cropped later
+
+        // Left half white, right half black, rendered at 64×32: back at 300×200, soft only at the seam.
+        var rgb = [UInt8](repeating: 0, count: 64 * 32 * 3)
+        for y in 0..<32 { for x in 0..<32 { for c in 0..<3 { rgb[(y * 64 + x) * 3 + c] = 255 } } }
+        let rendered = Fibo2RGBImage(rgb: rgb, width: 64, height: 32)
+        let matte = Fibo2Matte.matte(from: rendered, width: 300, height: 200)
+        XCTAssertEqual([matte.width, matte.height], [300, 200])
+        XCTAssertEqual(matte.pixels[100 * 300 + 20], 255)
+        XCTAssertEqual(matte.pixels[100 * 300 + 280], 0)
+        XCTAssertEqual(matte.coverage, 0.5, accuracy: 0.01)
+        let binary = Fibo2Matte.matte(from: rendered, width: 300, height: 200, binary: true)
+        XCTAssertEqual(Set(binary.pixels), [0, 255])
+        // A single-channel 8-bit PNG, and the cut-out carries it as alpha.
+        let png = try matte.pngData()
+        XCTAssertEqual([UInt8](png[24..<26]), [8, 0], "bit depth 8, colour type 0 (grey)")
+        let cutout = Fibo2Matte.cutout(source, matte: matte)
+        XCTAssertEqual(cutout.rgba[(100 * 300 + 20) * 4 + 3], 255)
+        XCTAssertEqual(cutout.rgba[(100 * 300 + 280) * 4 + 3], 0)
+        XCTAssertEqual(cutout.rgba[0], 200)
+    }
+
     func testMetaLevers() throws {
+        XCTAssertNil(try Fibo2MetaKeys.seed([:]))
+        XCTAssertEqual(try Fibo2MetaKeys.seed(["seed": .int(7)]), 7)
+        XCTAssertThrowsError(try Fibo2MetaKeys.seed(["seed": .int(-1)]))
+        XCTAssertThrowsError(try Fibo2MetaKeys.seed(["seed": .string("7")]))
         XCTAssertNil(try Fibo2MetaKeys.mask([:]))
         XCTAssertTrue(try Fibo2MetaKeys.textImages([:]))
         XCTAssertFalse(try Fibo2MetaKeys.textImages(["textImages": .bool(false)]))

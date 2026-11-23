@@ -1,4 +1,4 @@
-# fibo2-swift — Porting spec: Fibo 2.0 Dev → Swift/MLX
+# fibo2-swift — Porting spec: Fibo 2.0 Dev, Edit Turbo and RMBG 3.0 → Swift/MLX
 
 Task AB-T-0493 · channel decision AB-D-0226 (a Gaea plugin model) · oracle `../fibo2-oracle` (fp32 CPU torch goldens)
 
@@ -171,7 +171,31 @@ The package keeps the DiT and the VAE resident. The encoder loads per request an
 - **Lanes** (same seed, one image, 720×1440): int8 46.8 dB from bf16, int4 37.7 dB. Memory equals Dev's.
 - **Time:** not measured on a quiet GPU. From Dev's 3.8 s per pass with one image, about 15 s for the 4 steps.
 
-## 6. Known hazards
+## 6. RMBG 3.0 (v0.3.0)
+
+`briaai/RMBG-3.0` at `87330e3f87d9d856a21453e5acd120219984a66b` (2026-11-17), added 2026-11-22 at the operator's
+request, for Gaea.
+
+- **Licence:** CC BY-NC 4.0, `license_name: bria-fibo`, "the same terms as the Fibo 2.0 family" (its model card and
+  `LICENSE`). Gated behind its own form. Commercial terms: platform.bria.ai/licensing/pricing?model=rmbg-3.0. Same
+  channel as §1: a Gaea plugin model, named-only and opt-in. Bria states the training data is licensed.
+- **What it is:** `base_model: briaai/Fibo-2.0-dev` (finetune), "starting from Fibo 2.0's editing weights",
+  distilled to 4 steps without guidance. The repo holds `transformer/` (4 shards, 16.25 GB) and `model_index.json`
+  only. `transformer/config.json` is Edit Turbo's, byte for byte. The card loads the rest of the pipeline from
+  Edit Turbo.
+- **The call** (the card's snippet): `prompt = json.dumps({"edit_instruction": INSTRUCTION})` with one fixed
+  instruction, `image = source`, 4 steps, guidance 1, seed 0, fonts as for any edit; then
+  `result.convert("L").resize(source.size, LANCZOS)` is the matte, white = keep.
+- **In the port:** `Fibo2Matte` (the instruction, the request, luma and resize) and `Fibo2RMBGPackage` (`matting`).
+  No new model code.
+- **One deviation:** the picture goes in stretched to the trained size for its aspect ratio, not centre-cropped to
+  it (README, "RMBG 3.0"). The card's crop is `Fibo2Matte.Fit.crop`.
+- **Gates:** no oracle run for these weights (Edit Turbo's gates cover the code path). Checked: the render is grey,
+  three mattes by eye, lanes against bf16, and the process's memory peak under the declared footprints (README).
+- **Open:** a diffusers A/B of one matte on the same noise; a larger eval against BiRefNet on the pictures it gets
+  wrong.
+
+## 7. Known hazards
 
 - **Speed.** Dev is the non-distilled base: 2 DiT passes per step, 50 steps by the card. Fibo 2.0 Edit Turbo
   (same architecture, few steps, no CFG) is the practical edit model; it is gated separately.

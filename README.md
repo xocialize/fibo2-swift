@@ -2,7 +2,9 @@
 
 Swift/MLX port of Bria's Fibo 2.0: [Fibo 2.0 Dev](https://huggingface.co/briaai/Fibo-2.0-dev) (text-to-image,
 instruction editing, masked editing and multi-image editing of up to 5 images in one set of weights) and
-[Fibo 2.0 Edit Turbo](https://huggingface.co/briaai/Fibo-2.0-edit-turbo) (the same edits in 4 steps).
+[Fibo 2.0 Edit Turbo](https://huggingface.co/briaai/Fibo-2.0-edit-turbo) (the same edits in 4 steps), and
+[RMBG 3.0](https://huggingface.co/briaai/RMBG-3.0), Edit Turbo fine-tuned to render an alpha matte (background
+removal).
 - **DiT:** 8.1B parameters, 44 single-stream Z-Image blocks. A Perceiver resampler turns the prompt into 256–512
   "gist" tokens; five blocks also cross-attend to the text encoder directly.
 - **Conditioner:** 15 hidden-state taps of Qwen3-VL-4B-Instruct, which also sees the images to edit and small
@@ -110,6 +112,43 @@ swift run -c release Fibo2Gate render <edit-turbo snapshot> --shared <dev snapsh
   edit at one megapixel, plus about 5 s to encode and decode. Not yet timed on a quiet GPU.
 - **Engine package:** `MLXFibo2.Fibo2EditTurboPackage` (`fibo-2-edit-turbo`), `imageEdit` only. With a Dev snapshot in
   the model store it fetches only the 16 GB transformer.
+
+## RMBG 3.0
+
+Bria's background remover is the same architecture again: Edit Turbo fine-tuned and distilled to render a picture's
+alpha matte in 4 steps. Its repo holds a transformer only, so the port is one file, `Fibo2Matte.swift`: the fixed
+instruction the model was trained on, the card's settings (4 steps, no guidance, seed 0), and the picture's way in
+and out. The weights are CC BY-NC 4.0, "the same terms as the Fibo 2.0 family"; commercial terms are at
+<https://platform.bria.ai/licensing/pricing?model=rmbg-3.0>.
+
+```swift
+let pipeline = try await Fibo2Pipeline.load(snapshot: rmbgSnapshot, shared: devOrEditTurboSnapshot)
+let result = try pipeline.generate(Fibo2Matte.request(for: photo))
+let matte = Fibo2Matte.matte(from: result.image, width: photo.width, height: photo.height)   // white = keep
+try Fibo2PNG.write(Fibo2Matte.cutout(photo, matte: matte), to: outURL)
+```
+
+```bash
+swift run -c release Fibo2Gate matte <RMBG-3.0 snapshot> --shared <dev snapshot> --image photo.jpg --out matte.png --cutout cutout.png
+```
+
+- **The whole frame.** The model card's snippet calls the pipeline without a size, which centre-crops the picture to
+  the size trained for its aspect ratio, then stretches the matte over the whole picture. The strips the crop cut
+  off get no matte and the rest lands slightly off. Here the picture is stretched to that same size instead (a few
+  pixels in 1024 at most) and the matte stretched back, so it covers the frame and lines up. `--fit crop` is the
+  card's way: on a 5071×3294 photo the two mattes differ in 0.26 % of the pixels at the half-way line.
+- **No oracle run.** The transformer is Edit Turbo's architecture with other weights, and Edit Turbo's parity gates
+  cover the code path. What was checked for RMBG 3.0: the render is grey (largest R/G/B spread 6–18 of 255, where a
+  wrong instruction gives a coloured picture), and the mattes of a fox, a crow on a branch and three doves are right
+  by eye.
+- **Memory and time** (M5 Max, encoder loaded per request, the process's peak): bf16 29.4 GB, int8 21.5 GB, int4
+  19.9 GB, all under the footprints declared for a one-image edit. About 20 s a picture: 16 s of denoising, 2 s to
+  encode once the text encoder's file is cached, 1–2 s to decode.
+- **Lanes** against bf16, same picture: int8 moves 0.007 % of the pixels across the half-way line, int4 0.06 %.
+- **Engine package:** `MLXFibo2.Fibo2RMBGPackage` (`rmbg-3`), `matting` only. `preferredKind: .binary` thresholds
+  the matte at 128; `metaData["seed"]` (default 0) redraws it. Weights: `briaai/RMBG-3.0` pinned by commit for the
+  transformer; the text encoder, VAE and fonts from an Edit Turbo or Dev snapshot in the store, else from Edit
+  Turbo's repo.
 
 ## Not here
 

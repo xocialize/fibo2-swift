@@ -16,6 +16,8 @@
 //   Fibo2Gate render   <snapshot> --prompt <text|@file> [--negative <text|@file|card>] [--image p]… [--mask p]
 //                      [--size WxH] [--steps n] [--guidance g] [--seed s] [--quant bf16|int8|int4] [--te bf16|int8]
 //                      [--noise file.safetensors] [--dtype fp32|bf16] [--drop-te] [--shared <snapshot>] [--compare ref.png] [--no-text-images] --out out.png
+//   Fibo2Gate matte    <RMBG-3.0 snapshot> --shared <edit-turbo or dev snapshot> --image p --out matte.png
+//                      [--cutout cutout.png] [--rendered render.png] [--seed s] [--quant bf16|int8|int4] [--fit stretch|crop]
 
 import Fibo2
 import Flux2VAE
@@ -89,7 +91,7 @@ func check(_ ok: Bool, _ line: String) {
 }
 
 let args = Array(CommandLine.arguments.dropFirst())
-guard let command = args.first else { fail("usage: Fibo2Gate <prompts|textimg|sizes|schedule|encoder|dit|vae|render> …") }
+guard let command = args.first else { fail("usage: Fibo2Gate <prompts|textimg|sizes|schedule|encoder|dit|vae|render|matte> …") }
 
 func goldensURL() -> URL { URL(fileURLWithPath: args.count > 1 ? args[1] : die("missing <goldens>")) }
 func snapshotURL(_ index: Int = 2) -> URL { URL(fileURLWithPath: args.count > index ? args[index] : die("missing <snapshot>")) }
@@ -528,6 +530,71 @@ case "render":
     if let compare, let p = psnr(result.image, readImage(URL(fileURLWithPath: compare))) {
         print(String(format: "PSNR against %@: %.2f dB", compare, p))
     }
+
+case "matte":
+    // RMBG 3.0 end to end, on the engine package's memory path (the encoder loads per request).
+    let snapshot = snapshotURL(1)
+    var shared: URL? = nil, image: String? = nil, out: String? = nil, cutout: String? = nil, rendered: String? = nil
+    var quant = Fibo2Quant.bf16, seed = Fibo2Matte.defaultSeed, fit = Fibo2Matte.Fit.stretch
+    var i = 2
+    while i < args.count {
+        let flag = args[i]
+        func value() -> String { i += 1; return i < args.count ? args[i] : die("\(flag) needs a value") }
+        switch flag {
+        case "--shared": shared = URL(fileURLWithPath: value())
+        case "--image": image = value()
+        case "--out": out = value()
+        case "--cutout": cutout = value()
+        case "--rendered": rendered = value()
+        case "--seed": seed = UInt64(value()) ?? die("--seed s")
+        case "--quant": quant = Fibo2Quant(rawValue: value()) ?? die("--quant bf16|int8|int4")
+        case "--fit": fit = Fibo2Matte.Fit(rawValue: value()) ?? die("--fit stretch|crop")
+        default: fail("unknown option \(flag)")
+        }
+        i += 1
+    }
+    guard let image, let out else { fail("matte needs --image and --out") }
+    let source = readImage(URL(fileURLWithPath: image))
+    let request = Fibo2Matte.request(for: source, seed: seed, fit: fit)
+    var clock = Date()
+    MLX.Memory.cacheLimit = 2 << 30  // the engine's pool cap
+    let pipeline = try await Fibo2Pipeline.load(snapshot: snapshot, shared: shared, quant: quant, textEncoderQuant: nil)
+    MLX.Memory.clearCache()
+    let resident = MLX.Memory.activeMemory
+    print(String(format: "loaded in %.1f s (DiT %@), resident %.2f GB; phys_footprint %.2f GB now, %.2f GB peak",
+                 Date().timeIntervalSince(clock), quant.rawValue, Double(resident) / 1e9, physFootprint().now, physFootprint().peak))
+    clock = Date()
+    MLX.Memory.peakMemory = 0
+    let encoded = try await { () async throws -> Fibo2Pipeline.Encoded in
+        let encoder = try await Fibo2TextEncoder.load(snapshot: shared ?? snapshot, quant: .bf16)
+        return try pipeline.encode(request, encoder: encoder)
+    }()
+    MLX.Memory.clearCache()
+    print(String(format: "  encode phase: %.1f s, peak %.2f GB (+%.2f over resident); phys_footprint %.2f GB now, %.2f GB peak",
+                 Date().timeIntervalSince(clock), Double(MLX.Memory.peakMemory) / 1e9,
+                 Double(MLX.Memory.peakMemory - resident) / 1e9, physFootprint().now, physFootprint().peak))
+    MLX.Memory.peakMemory = 0
+    let result = try pipeline.generate(request, encoded: encoded)
+    print(String(format: "  denoise + decode: peak %.2f GB (+%.2f over resident); phys_footprint %.2f GB now, %.2f GB peak",
+                 Double(MLX.Memory.peakMemory) / 1e9, Double(MLX.Memory.peakMemory - resident) / 1e9,
+                 physFootprint().now, physFootprint().peak))
+    let resize = Date()
+    let matte = Fibo2Matte.matte(from: result.image, width: source.width, height: source.height)
+    try matte.write(to: URL(fileURLWithPath: out))
+    if let rendered { try result.image.write(to: URL(fileURLWithPath: rendered)) }
+    if let cutout { try Fibo2PNG.write(Fibo2Matte.cutout(source, matte: matte), to: URL(fileURLWithPath: cutout)) }
+    // A matte is grey: a coloured render means the instruction or the weights are wrong.
+    var chroma = 0
+    for p in 0..<(result.width * result.height) {
+        let (r, g, b) = (Int(result.image.rgb[p * 3]), Int(result.image.rgb[p * 3 + 1]), Int(result.image.rgb[p * 3 + 2]))
+        chroma = max(chroma, max(r, g, b) - min(r, g, b))
+    }
+    let t = result.timings
+    print(String(format: "%d×%d picture, rendered at %d×%d (%@), seed %llu: denoise %.1f s, decode %.1f s, resize %.1f s, %.1f s in all",
+                 source.width, source.height, result.width, result.height, fit.rawValue, seed, t["denoise"] ?? 0,
+                 t["decode"] ?? 0, Date().timeIntervalSince(resize), Date().timeIntervalSince(clock)))
+    print(String(format: "matte: %.1f %% of the frame at 128 or above; largest R/G/B spread in the render %d of 255", matte.coverage * 100, chroma))
+    print("wrote \(out)")
 
 default:
     fail("unknown command \(command)")

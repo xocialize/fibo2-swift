@@ -1,6 +1,7 @@
 // MLXEngine packages for Bria's Fibo 2.0 on one core:
 //   - Fibo2DevPackage (`fibo-2-dev`): `textToImage` + `imageEdit`, the full base model;
-//   - Fibo2EditTurboPackage (`fibo-2-edit-turbo`): `imageEdit` only, distilled to 4 steps without guidance.
+//   - Fibo2EditTurboPackage (`fibo-2-edit-turbo`): `imageEdit` only, distilled to 4 steps without guidance;
+//   - Fibo2RMBGPackage (`rmbg-3`): `matting` only. Bria's RMBG 3.0, Edit Turbo fine-tuned to render an alpha matte.
 //
 // LICENCE (C7): the weights are CC BY-NC 4.0 (`license_name: bria-fibo`), behind Bria's non-commercial access form;
 // commercial use needs an agreement with Bria. It is declared as the SPDX id `CC-BY-NC-4.0`, package-locally, and is
@@ -92,6 +93,18 @@ public enum Fibo2MetaKeys {
         }
     }
 
+    /// Int ≥ 0, RMBG 3.0 only: the noise seed of the matte. Default 0, the model card's. (`MattingRequest` has no
+    /// seed field.) The card reports rare broken mattes; another seed is the way to retry one.
+    public static let seed = "seed"
+
+    static func seed(_ meta: MetaData) throws -> UInt64? {
+        switch meta[seed] {
+        case nil, .null?: return nil
+        case .int(let n)? where n >= 0: return UInt64(n)
+        default: throw PackageError.unsupportedRequestFeature("metaData[\"\(seed)\"] is a whole number, 0 or more")
+        }
+    }
+
     static func textImages(_ meta: MetaData) throws -> Bool {
         switch meta[textImages] {
         case nil, .null?: return true
@@ -175,6 +188,7 @@ enum Fibo2Serving {
 
     static func run(_ request: any CapabilityRequest, generator: Fibo2Generator,
                     configuration c: Fibo2Configuration) async throws -> any CapabilityResponse {
+        if c.variant == .rmbg { return try await matte(request, generator: generator) }
         var req = Fibo2Pipeline.Request(prompt: "")
         let steps: Int?, guidance: Double?, seed: UInt64?
         let meta: MetaData
@@ -232,6 +246,29 @@ enum Fibo2Serving {
         return request.capability == .textToImage ? T2IResponse(image: artifact) : IEditResponse(image: artifact)
     }
 
+    /// RMBG 3.0: one edit with the instruction the model was trained on, 4 steps without guidance. The picture goes in
+    /// whole, stretched to the trained size for its aspect ratio; the matte comes back at the picture's size.
+    static func matte(_ request: any CapabilityRequest, generator: Fibo2Generator) async throws -> any CapabilityResponse {
+        guard request.capability == .matting, let matting = request as? MattingRequest else {
+            throw PackageError.unsupportedCapability(request.capability)
+        }
+        let source: Fibo2RGBImage
+        do { source = try Fibo2RGBImage.read(data: matting.image.data) } catch { throw Fibo2PackageError.imageDecode }
+        let req = Fibo2Matte.request(for: source, seed: try Fibo2MetaKeys.seed(matting.metaData) ?? Fibo2Matte.defaultSeed)
+        if let why = Fibo2Envelope.violation(width: req.width, height: req.height, imageCount: 1) {
+            throw Fibo2PackageError.outsideMeasuredEnvelope(why)
+        }
+        try Task.checkCancellation()
+        let result = try await generator.generate(req)
+        try Task.checkCancellation()
+        let binary = matting.preferredKind == .binary
+        let matte = Fibo2Matte.matte(from: result.image, width: source.width, height: source.height, binary: binary)
+        let png: Data
+        do { png = try matte.pngData() } catch { throw Fibo2PackageError.pngEncode }
+        return MattingResponse(matte: Matte(data: png, width: matte.width, height: matte.height,
+                                            kind: binary ? .binary : .softAlpha))
+    }
+
     /// What a caller (or an agent writing the prompt) must know: the model reads structured captions.
     nonisolated static let promptGuidance =
         "Fibo 2.0 was trained on STRUCTURED JSON CAPTIONS (Bria's VGL, docs.bria.ai/vgl): a JSON object with "
@@ -271,6 +308,18 @@ enum Fibo2Serving {
             edit = "Fibo 2.0 Edit Turbo instruction editing (Bria; distilled from Fibo 2.0 Dev): 4 steps without "
                 + "guidance, one DiT pass a step, so a negative prompt does nothing. Editing only. " + editCommon + licenceNote
             surfaces = [IEditContract.descriptor(name: variant.packageName, summary: edit, modes: [])]
+        case .rmbg:
+            surfaces = [MattingContract.descriptor(
+                name: variant.packageName,
+                summary: "RMBG 3.0 (Bria): background removal as an image edit. Fibo 2.0 Edit Turbo fine-tuned and "
+                    + "distilled to render a soft alpha matte in 4 steps without guidance: white is the subject, grey is "
+                    + "partial transparency at hair, fur and motion blur. It knows what the subject is: group shots, "
+                    + "holes in mesh and spokes, cast shadows left out. The matte is rendered at about one megapixel "
+                    + "and resized to the picture, so it is softer than the pixels of a large picture. Glass, veils and "
+                    + "smoke tend to come out opaque. An 8.1B model: seconds per picture, not a fast matte. "
+                    + "preferredKind \"binary\" thresholds the matte at 128. metaData[\"seed\"] (default 0) changes "
+                    + "the noise, to retry a broken matte. " + licenceNote,
+                modes: [])]
         }
         return PackageManifest(
             license: LicenseDeclaration(weightLicense: .ccByNC4, portCodeLicense: .mit),
@@ -359,4 +408,44 @@ public final class Fibo2EditTurboPackage: ModelPackage {
 
 extension Fibo2EditTurboPackage {
     public nonisolated static var registration: PackageRegistration { .of(Fibo2EditTurboPackage.self) }
+}
+
+/// RMBG 3.0: the same architecture, Edit Turbo fine-tuned and distilled to render an alpha matte. Matting only.
+@InferenceActor
+public final class Fibo2RMBGPackage: ModelPackage {
+    public typealias Configuration = Fibo2Configuration
+
+    public nonisolated static var manifest: PackageManifest { Fibo2Serving.manifest(.rmbg) }
+
+    let configuration: Configuration
+    private var generator: Fibo2Generator?
+
+    /// The variant and the model's 4 unguided steps are this package's, whatever the configuration carries.
+    public nonisolated init(configuration: Configuration) {
+        var c = configuration
+        c.variant = .rmbg
+        c.steps = nil
+        c.guidance = nil
+        self.configuration = c
+    }
+
+    public func load() async throws {
+        guard generator == nil else { return }
+        generator = try await Fibo2Serving.load(configuration)
+    }
+
+    public func unload() async {
+        generator = nil
+        MLX.Memory.clearCache()
+    }
+
+    public func run(_ request: any CapabilityRequest) async throws -> any CapabilityResponse {
+        try Task.checkCancellation()  // CAN-1: first act of run()
+        guard let generator else { throw PackageError.notLoaded }
+        return try await Fibo2Serving.run(request, generator: generator, configuration: configuration)
+    }
+}
+
+extension Fibo2RMBGPackage {
+    public nonisolated static var registration: PackageRegistration { .of(Fibo2RMBGPackage.self) }
 }

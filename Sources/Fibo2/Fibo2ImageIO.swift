@@ -285,4 +285,20 @@ public enum Fibo2PNG {
         guard CGImageDestinationFinalize(dest) else { throw Fibo2Error.invalidInput("PNG encode failed") }
         return out as Data
     }
+
+    /// 8-bit grey -> a single-channel PNG (a matte).
+    public static func pngData(_ image: Fibo2GrayImage) throws -> Data {
+        guard let provider = CGDataProvider(data: Data(image.pixels) as CFData),
+              let cg = CGImage(width: image.width, height: image.height, bitsPerComponent: 8, bitsPerPixel: 8,
+                               bytesPerRow: image.width, space: CGColorSpaceCreateDeviceGray(),
+                               bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                               provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+        else { throw Fibo2Error.invalidInput("cannot build CGImage") }
+        let out = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(out, UTType.png.identifier as CFString, 1, nil)
+        else { throw Fibo2Error.invalidInput("cannot create PNG destination") }
+        CGImageDestinationAddImage(dest, cg, nil)
+        guard CGImageDestinationFinalize(dest) else { throw Fibo2Error.invalidInput("PNG encode failed") }
+        return out as Data
+    }
 }

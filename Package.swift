@@ -1,5 +1,5 @@
 // swift-tools-version: 6.2
-// fibo2-swift — Swift/MLX port of briaai/Fibo-2.0-dev and Fibo-2.0-edit-turbo (weights CC BY-NC 4.0, gated; see PORTING-SPEC.md §1 — the
+// fibo2-swift — Swift/MLX port of briaai/Fibo-2.0-dev, Fibo-2.0-edit-turbo and RMBG-3.0 (weights CC BY-NC 4.0, gated; see PORTING-SPEC.md §1 — the
 // port code here is MIT): an 8.1B single-stream DiT of Z-Image blocks with a Perceiver "gist" resampler and five
 // cross-attention injection blocks, conditioned on 15 hidden-state taps of Qwen3-VL-4B-Instruct (which also sees the
 // images to edit and images of the caption's text), in the FLUX.2 VAE's latent space. One set of weights for
@@ -15,7 +15,8 @@ let package = Package(
     products: [
         .library(name: "Fibo2", targets: ["Fibo2"]),
         // MLXEngine packages: Fibo2DevPackage (fibo-2-dev; textToImage + imageEdit) and Fibo2EditTurboPackage
-        // (fibo-2-edit-turbo; imageEdit). Non-commercial weights: Gaea plugin models (AB-D-0226), never a shipping route.
+        // (fibo-2-edit-turbo; imageEdit) and Fibo2RMBGPackage (rmbg-3; matting). Non-commercial weights: Gaea plugin
+        // models (AB-D-0226), never a shipping route.
         .library(name: "MLXFibo2", targets: ["MLXFibo2"]),
         .executable(name: "Fibo2Gate", targets: ["Fibo2Gate"]),
     ],

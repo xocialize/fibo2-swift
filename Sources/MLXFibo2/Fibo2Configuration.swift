@@ -1,5 +1,5 @@
 // Init-time configuration (C9) for the Fibo 2.0 packages, parameterized by checkpoint. The wrapping package
-// (Fibo2DevPackage / Fibo2EditTurboPackage) fixes the variant.
+// (Fibo2DevPackage / Fibo2EditTurboPackage / Fibo2RMBGPackage) fixes the variant.
 //
 // Weights materialize from Bria's own repos, pinned by commit. Both are GATED (a non-commercial access form each), so
 // nothing is mirrored and a first download needs a Hugging Face token whose account has been granted access; the
@@ -10,6 +10,9 @@
 // only `transformer/` differs. Edit Turbo therefore declares two sources in its own repo, its transformer and the
 // shared components, and takes the shared ones from a Dev snapshot when one is already installed: 16 GB to fetch, not
 // 25.
+//
+// RMBG 3.0's repo holds a transformer only. Its shared components are Edit Turbo's (the model card's base), read from
+// an Edit Turbo or a Dev snapshot already in the store, else fetched from Edit Turbo's repo.
 
 import Fibo2
 import Foundation
@@ -20,11 +23,14 @@ public enum Fibo2Variant: String, Codable, Sendable, CaseIterable {
     case dev
     /// Distilled from Dev for editing: 4 steps, no guidance. Editing only.
     case editTurbo
+    /// RMBG 3.0: Edit Turbo fine-tuned and distilled to render an alpha matte. Matting only.
+    case rmbg
 
     public var repo: String {
         switch self {
         case .dev: "briaai/Fibo-2.0-dev"
         case .editTurbo: "briaai/Fibo-2.0-edit-turbo"
+        case .rmbg: "briaai/RMBG-3.0"
         }
     }
 
@@ -33,13 +39,29 @@ public enum Fibo2Variant: String, Codable, Sendable, CaseIterable {
         switch self {
         case .dev: "b01e5a34a0a9540c65f585c2c281535deabac16d"
         case .editTurbo: "7b133d62d92e897f1468af0427a73cc41a03cb5d"
+        case .rmbg: "87330e3f87d9d856a21453e5acd120219984a66b"
         }
     }
 
+    /// Where a variant without its own text encoder, VAE and fonts fetches them: RMBG 3.0 takes Edit Turbo's.
+    public var sharedSource: Fibo2Variant { self == .rmbg ? .editTurbo : self }
+
     public var defaultSteps: Int { self == .dev ? Fibo2Schedule.defaultSteps : Fibo2Schedule.turboSteps }
     public var defaultGuidance: Double { Double(self == .dev ? Fibo2Schedule.defaultGuidance : Fibo2Schedule.turboGuidance) }
-    public var packageName: String { self == .dev ? "fibo-2-dev" : "fibo-2-edit-turbo" }
-    public var title: String { self == .dev ? "Fibo 2.0 Dev" : "Fibo 2.0 Edit Turbo" }
+    public var packageName: String {
+        switch self {
+        case .dev: "fibo-2-dev"
+        case .editTurbo: "fibo-2-edit-turbo"
+        case .rmbg: "rmbg-3"
+        }
+    }
+    public var title: String {
+        switch self {
+        case .dev: "Fibo 2.0 Dev"
+        case .editTurbo: "Fibo 2.0 Edit Turbo"
+        case .rmbg: "RMBG 3.0"
+        }
+    }
 }
 
 public struct Fibo2Configuration: PackageConfiguration, ModelStorable, QuantConfigured, FootprintConfigured,
@@ -68,6 +90,8 @@ public struct Fibo2Configuration: PackageConfiguration, ModelStorable, QuantConf
 
     /// A snapshot's transformer files, and the components both checkpoints share.
     public static let transformerFiles = ["model_index.json", "README.md", "transformer/*", "scheduler/*"]
+    /// RMBG 3.0's repo: a transformer and its licence. No scheduler folder (the sampler's constants are in code).
+    public static let matteTransformerFiles = ["model_index.json", "README.md", "LICENSE", "transformer/*"]
     public static let sharedFiles = ["text_encoder/*", "processor/*", "vae/*", "fonts/*"]
 
     public init(variant: Fibo2Variant = .dev, quant: Quant = .bf16, textEncoderQuant: Fibo2TextEncoderQuant = .bf16,
@@ -118,6 +142,12 @@ public struct Fibo2Configuration: PackageConfiguration, ModelStorable, QuantConf
                                  matching: Self.transformerFiles),
                     WeightSource(role: "shared", repo: variant.repo, revision: variant.revision,
                                  matching: Self.sharedFiles)]
+        case .rmbg:
+            let shared = variant.sharedSource
+            return [WeightSource(role: "transformer", repo: variant.repo, revision: variant.revision,
+                                 matching: Self.matteTransformerFiles),
+                    WeightSource(role: "shared", repo: shared.repo, revision: shared.revision,
+                                 matching: Self.sharedFiles)]
         }
     }
 
@@ -147,12 +177,14 @@ public struct Fibo2Configuration: PackageConfiguration, ModelStorable, QuantConf
     }
 
     /// The root of the shared components: the explicit path; the transformer's own root when it holds them; else this
-    /// variant's snapshot in the store, else a Dev snapshot there (the same bytes).
+    /// variant's snapshot in the store, else an Edit Turbo snapshot (RMBG 3.0's base), else a Dev snapshot there (the
+    /// same bytes).
     public func resolvedSharedDirectory(storeRoot: URL?) -> URL? {
         if !sharedSnapshotPath.isEmpty { return URL(fileURLWithPath: sharedSnapshotPath) }
         if !snapshotPath.isEmpty, Self.hasShared(URL(fileURLWithPath: snapshotPath)) { return URL(fileURLWithPath: snapshotPath) }
         let store = ModelStore(root: storeRoot)
         if let own = Self.storeDirectory(store, variant, where: Self.hasShared) { return own }
+        if variant == .rmbg, let turbo = Self.storeDirectory(store, .editTurbo, where: Self.hasShared) { return turbo }
         if variant != .dev, let dev = Self.storeDirectory(store, .dev, where: Self.hasShared) { return dev }
         return nil
     }
